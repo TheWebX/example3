@@ -6,4 +6,4 @@ pip install opencv-python pyzbar
 
 
 # Corrected command with real filenames
-python query_builder.py DQ_Template_Bulk_Catalogue_updated_clean_index_new.xlsx Fromcheck taxonomy_backup_2025.csv availability_backup_2025.csv --max-headers 50
+python query_builder.py DQ_Template_Bulk_Catalogue_updated_clean_index_new.xlsx Fromcheck export_CATALOGUE_TAXONOMY.csv export_DATASET_AVAILABILITY_DETAIL.csv --max-headers 50
