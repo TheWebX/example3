@@ -3,253 +3,230 @@ import json
 import os
 import math
 import qrcode
-import argparse
+import sys
 import tkinter as tk
 from PIL import Image, ImageTk
 import threading
-import queue # Added for thread-safe image passing
+import argparse
+import queue
+import time
 
 # --- Configuration ---
-# This must match the receiver script to be scannable.
+# Set the size of the data chunk (in bytes)
+# This *must* match the receiver script
 CHUNK_SIZE_BYTES = 2048
 # ---------------------
 
+def get_file_chunks(file_path):
+    """Reads a file and yields binary chunks of it."""
+    try:
+        with open(file_path, 'rb') as f:
+            while True:
+                chunk = f.read(CHUNK_SIZE_BYTES)
+                if not chunk:
+                    break
+                yield chunk
+    except FileNotFoundError:
+        print(f"Error: Source file '{file_path}' not found.")
+        return None
+    except Exception as e:
+        print(f"Error reading file '{file_path}': {e}")
+        return None
+
+def generate_qr_image(data, box_size=6):
+    """Generates a single QR code image in memory."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=box_size,
+        border=4,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    return img
+
 class QRPresenter:
     """
-    A simple Tkinter app to display a series of QR code images.
-    It loads images from a queue as they are generated in a background thread.
+    A Tkinter GUI class to display images from a queue.
     """
-    def __init__(self, root, total_parts, filename, image_queue, remediation_list=None):
+    def __init__(self, root, image_queue, total_parts):
         self.root = root
-        self.total_parts = total_parts
-        self.filename = filename
         self.image_queue = image_queue
+        self.total_parts = total_parts
+        self.current_part = 0
         
-        # Calculate the number of parts to be sent
-        if remediation_list:
-            self.parts_to_send = len(remediation_list)
-        else:
-            self.parts_to_send = total_parts
-            
-        self.parts_sent = 0
+        self.root.title("QR Code Broadcaster")
+        # Set window size and position (1200x1200 at top-left corner)
+        self.root.geometry("1200x1200+0+0")
         
-        # 1. Setup the window
-        self.root.title(f"Sending: {filename}")
+        # Configure the window to not be resizable
+        self.root.resizable(False, False)
         
-        # 2. Create a label for text
-        self.info_label = tk.Label(root, text=f"Generating Part 1 of {self.parts_to_send}...\nPlease wait.", font=("Helvetica", 16))
-        self.info_label.pack(pady=10)
-        
-        # 3. Create a label to hold the QR code image
-        self.qr_label = tk.Label(root)
-        # Center the label in the available space
-        self.qr_label.pack(padx=20, pady=20, expand=True)
-        
-        # Start the consumer loop
+        # Set a black background
+        self.root.configure(bg='black')
+
+        self.label = tk.Label(root, bg='black')
+        # Use expand=True to center the label in the window
+        self.label.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
         self.check_for_image()
 
     def check_for_image(self):
         """
-        Checks the queue for a new image.
-        If found, displays it and schedules the next check after 1 sec.
-        If not found, schedules a retry in 100ms.
+        Checks the queue for a new image and displays it.
+        This is the main GUI loop.
         """
         try:
-            # Try to get an image from the queue without blocking
-            img, part_num_absolute = self.image_queue.get_nowait()
+            # Get an image from the queue (non-blocking)
+            img = self.image_queue.get_nowait()
             
+            # A 'None' object is the signal to stop
             if img is None:
-                # Sentinel value: This means generation is complete
-                self.info_label.config(text=f"All {self.parts_to_send} parts sent.\nYou can close this window.")
+                self.show_end_message()
                 return
+
+            # Convert the PIL image to a PhotoImage
+            self.photo = ImageTk.PhotoImage(img)
+            self.label.config(image=self.photo)
             
-            # We got an image! Increment counter and display it.
-            self.parts_sent += 1
-            
-            # Convert the PIL image to a Tkinter-compatible photo image
-            tk_img = ImageTk.PhotoImage(img)
-            
-            # Update the image label
-            self.qr_label.config(image=tk_img)
-            # Keep a reference to the image to prevent garbage collection
-            self.qr_label.image = tk_img
-            
-            # Update the text label
-            self.info_label.config(text=f"Part {part_num_absolute} of {self.total_parts}\n(Sending {self.parts_sent} of {self.parts_to_send} parts)\n(Broadcasting automatically...)")
-            print(f"Showing part {part_num_absolute}/{self.total_parts} (Sent {self.parts_sent}/{self.parts_to_send})")
-            
-            # Schedule the *next check* after the 1-second display time
-            self.root.after(1000, self.check_for_image)
+            self.current_part += 1
+            self.root.title(f"QR Code Broadcaster - Part {self.current_part}/{self.total_parts}")
+
+            # Schedule the next check (100ms = 10 FPS)
+            self.root.after(100, self.check_for_image)
 
         except queue.Empty:
-            # Queue is empty, means generator is still working
-            # Schedule a retry in 100ms without incrementing the counter
-            self.root.after(100, self.check_for_image)
-        
-        except Exception as e:
-            print(f"Error displaying image: {e}")
-            self.info_label.config(text=f"Error displaying part {self.parts_sent + 1}!")
+            # If the queue is empty, check again in 10ms
+            # This allows the generator to catch up
+            self.root.after(10, self.check_for_image)
 
+    def show_end_message(self):
+        """Displays a 'Finished' message."""
+        # Clear the image
+        self.label.config(image=None, text="All parts sent.", font=("Arial", 30), fg="white")
+        self.root.title("QR Code Broadcaster - Finished")
 
-def get_file_info(source_file):
-    """Reads file and calculates total parts."""
-    try:
-        with open(source_file, 'rb') as f:
-            file_data = f.read()
-    except FileNotFoundError:
-        print(f"Error: Source file '{source_file}' not found.")
-        return None, None, None
-    except Exception as e:
-        print(f"Error reading file: {e}")
-        return None, None, None
-
-    total_size = len(file_data)
-    total_parts = math.ceil(total_size / CHUNK_SIZE_BYTES)
-    filename = os.path.basename(source_file)
-    
-    print(f"Source file: '{filename}' ({total_size} bytes)")
-    print(f"Chunk size: {CHUNK_SIZE_BYTES} bytes")
-    print(f"Total QR codes to generate: {total_parts}\n")
-    
-    return file_data, total_parts, filename
-
-def generate_qr_images_to_queue(file_data, total_parts, filename, image_queue, remediation_list=None):
+def generation_thread(file_path, remediation_parts, image_queue):
     """
-    (This function runs in a separate thread)
-    Generates QR codes one by one and puts them in the queue.
-    If remediation_list is provided, it only generates parts from that list.
+    This runs in a background thread.
+    It reads the file and generates QR codes "just-in-time".
+    It puts the generated images into the image_queue.
     """
     try:
-        if remediation_list:
-            print(f"Starting REMEDIATION. Sending {len(remediation_list)} specific parts...")
-            part_iterator = remediation_list
-        else:
-            print("Starting QR code generation thread...")
-            part_iterator = range(1, total_parts + 1)
+        file_size = os.path.getsize(file_path)
+        total_parts = math.ceil(file_size / CHUNK_SIZE_BYTES)
         
-        for part_number in part_iterator:
-            # Ensure part_number is an integer
-            part_number = int(part_number)
+        print(f"Total parts to generate: {total_parts}")
+        
+        # Get the filename to embed in the payload
+        file_name = os.path.basename(file_path)
+
+        for part_number, chunk_data in enumerate(get_file_chunks(file_path), 1):
             
-            start_byte = (part_number - 1) * CHUNK_SIZE_BYTES
-            end_byte = part_number * CHUNK_SIZE_BYTES
+            # --- Remediation Logic ---
+            # If a remediation list is provided,
+            # skip parts that are NOT in the list.
+            if remediation_parts and part_number not in remediation_parts:
+                continue
             
-            chunk_data = file_data[start_byte:end_byte]
-            
+            print(f"  > Broadcasting part {part_number}/{total_parts}")
+
             # Encode the binary chunk to a Base64 string
             base64_data = base64.b64encode(chunk_data).decode('utf-8')
             
-            # Create the JSON payload (must match receiver's format)
+            # Create the JSON payload
             payload = {
                 "p": part_number,
                 "t": total_parts,
-                "f": filename,
+                "f": file_name,
                 "d": base64_data
             }
-            
             json_string = json.dumps(payload)
             
-            # Generate the QR code image in memory
-            qr = qrcode.QRCode(
-                version=None,
-                error_correction=qrcode.constants.ERROR_CORRECT_L,
-                box_size=6, # Fits well in 1200x1200 window
-                border=4,
-            )
-            qr.add_data(json_string)
-            qr.make(fit=True)
+            # Generate the QR code image
+            img = generate_qr_image(json_string, box_size=6)
             
-            img = qr.make_image(fill_color="black", back_color="white")
-            
-            # Add a print statement to show progress
-            print(f"  > Generated image {part_number}/{total_parts}")
-            
-            # Put the generated image in the queue.
-            # This will BLOCK if the queue is full (maxsize=1)
-            # until the main thread takes the image out.
-            # We send a tuple: (image, part_number)
-            image_queue.put((img, part_number))
-            
-        # After loop, put the sentinel value (None, None) to signal the end
-        image_queue.put((None, None))
+            # Put the image into the queue.
+            # This will block if the queue is full (size=1),
+            # forcing this thread to wait until the GUI
+            # has consumed the previous image.
+            image_queue.put(img)
+
+        # Send a 'None' signal to tell the GUI thread we are done
+        image_queue.put(None)
 
     except Exception as e:
-        print(f"\n--- ERROR during QR Generation ---")
-        print(e)
-        # Put sentinel value to stop the GUI loop on error
-        image_queue.put((None, None))
-
+        print(f"Error in generation thread: {e}")
+        image_queue.put(None) # Ensure the GUI stops
 
 def main():
-    # Setup command-line argument parsing
-    parser = argparse.ArgumentParser(description="Display a file as a series of QR codes.")
+    # Set up argument parsing
+    parser = argparse.ArgumentParser(description="Broadcast a file as a series of QR codes.")
     parser.add_argument("file", help="The path to the file you want to send.")
-    parser.add_description = "Path to a JSON file listing missing parts to resend."
-    parser.add_argument("--remediate", help="Path to a JSON file listing missing parts to resend.", default=None)
+    parser.add_argument("--remediate", help="Path to a 'missing_parts.json' file for remediation.")
+    
     args = parser.parse_args()
 
-    # 1. Get file info first
-    file_data, total_parts, filename = get_file_info(args.file)
-    
-    if not file_data:
-        print("Could not read file. Exiting.")
-        return
-
-    # 2. Check for remediation mode
-    remediation_list = None
+    # --- Remediation Logic ---
+    remediation_parts = None
     if args.remediate:
         try:
             with open(args.remediate, 'r') as f:
                 remediation_data = json.load(f)
-                remediation_list = remediation_data.get("missing")
-                
-                # Check that the filename matches
-                if remediation_data.get("filename") != filename:
-                    print(f"Error: The missing parts file is for '{remediation_data.get('filename')}',")
-                    print(f"but you are trying to send '{filename}'.")
-                    print("Exiting.")
-                    return
-                    
-            if not remediation_list:
-                print(f"Error: '{args.remediate}' is not a valid remediation file or has no missing parts.")
+                remediation_parts = set(remediation_data.get("missing", []))
+            if not remediation_parts:
+                print("Error: Remediation file is empty or invalid.")
                 return
+            print(f"--- REMEDIATION MODE ---")
+            print(f"Only sending {len(remediation_parts)} missing parts: {sorted(list(remediation_parts))}")
         except FileNotFoundError:
-            print(f"Error: Remediation file '{args.remediate}' not found.")
+            print(f"Error: Remediation file not found at '{args.remediate}'")
             return
         except json.JSONDecodeError:
             print(f"Error: Could not parse remediation file '{args.remediate}'.")
             return
+    # -------------------------
 
-    # 3. Create the main Tkinter window
-    root = tk.Tk()
-    # Set the window size and position (top-left corner)
-    root.geometry("1200x1200+0+0")
-    
-    # 4. Create a thread-safe queue with a max size of 1.
-    # This acts as a buffer, ensuring the generator doesn't
-    # get more than one image ahead of the display.
+    # Check if the main file exists
+    if not os.path.exists(args.file):
+        print(f"Error: Source file '{args.file}' not found.")
+        return
+
+    # This queue has a max size of 1.
+    # This creates a "producer-consumer" model where the
+    # generation thread (producer) waits for the GUI (consumer)
+    # to be ready for the next frame.
     image_queue = queue.Queue(maxsize=1)
-    
-    # 5. Create the app instance
-    app = QRPresenter(root, total_parts, filename, image_queue, remediation_list)
-    
-    # 6. Create and start the generation thread
-    generation_thread = threading.Thread(
-        target=generate_qr_images_to_queue,
-        args=(file_data, total_parts, filename, image_queue, remediation_list),
-        daemon=True # A daemon thread exits when the main program exits
-    )
-    
-    try:
-        generation_thread.start()
-        # 7. Start the GUI event loop
-        #    This runs *immediately*.
-        root.mainloop()
-        
-    finally:
-        # 8. Clean up
-        print("\nWindow closed. Exiting.")
 
+    # Calculate total parts for the GUI title
+    file_size = os.path.getsize(args.file)
+    total_parts = math.ceil(file_size / CHUNK_SIZE_BYTES)
+    
+    if remediation_parts:
+        display_total = len(remediation_parts)
+    else:
+        display_total = total_parts
+
+    # Start the Tkinter GUI
+    root = tk.Tk()
+    app = QRPresenter(root, image_queue, display_total)
+
+    # Start the background thread for QR generation
+    gen_thread = threading.Thread(
+        target=generation_thread,
+        args=(args.file, remediation_parts, image_queue),
+        daemon=True
+    )
+    gen_thread.start()
+
+    # Start the Tkinter main loop
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("\nBroadcast stopped by user.")
+    finally:
+        print("Closing application.")
 
 if __name__ == "__main__":
     main()

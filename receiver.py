@@ -2,6 +2,8 @@ import base64
 import json
 import time
 import os
+import multiprocessing as mp
+import queue # For the "Empty" exception
 from PIL import ImageGrab
 from pyzbar.pyzbar import decode
 
@@ -11,7 +13,17 @@ CHUNK_SIZE_BYTES = 2048
 # Set how long to wait (in seconds) after the last *new* part is
 # found before automatically timing out.
 SCAN_TIMEOUT_SECONDS = 5
+# How many screenshots to grab per second
+GRAB_FPS = 20 # Increased to 20 to over-sample the 10fps broadcast
+# How many parallel processes to use for decoding
+# Using all available cores is a good default
+NUM_DECODERS = mp.cpu_count()
+# Bounding box for the screen grab. Grabbing a smaller area
+# is MUCH faster. This box matches the sender's window.
+# Format is (X1, Y1, X2, Y2)
+# GRAB_BBOX = (0, 0, 1200, 1200) # Disabling this to scan full screen for better reliability
 # ---------------------
+
 
 def save_draft_and_exit(chunks, total_parts, output_filename):
     """
@@ -29,13 +41,17 @@ def save_draft_and_exit(chunks, total_parts, output_filename):
     found_parts = set(chunks.keys())
     missing_parts = sorted(list(all_parts - found_parts))
 
+    # --- Corrected Logic Block ---
     if not missing_parts:
-        if len(found_parts) == total_parts:
-             print("All parts were found, but process was interrupted before final save.")
-             print("The final file was not assembled. Please re-run the scanner.")
-        else:
-            print("Error: No missing parts, but total parts do not match. Exiting.")
+        # This means all parts were found, but the user interrupted
+        # the script *after* the main loop finished but *before*
+        # the final file was written (a very small window of time).
+        print("All parts were found, but process was interrupted before final save.")
+        print("The final file was not assembled. Please re-run the scanner to assemble.")
+        # We don't save a draft, as all parts are in memory (but lost)
+        # or the final file should have been written.
         return
+    # --- End of Corrected Block ---
 
     print(f"Found {len(found_parts)} of {total_parts} parts.")
     print(f"Missing {len(missing_parts)} parts: {missing_parts}")
@@ -68,19 +84,10 @@ def save_draft_and_exit(chunks, total_parts, output_filename):
                     f_out.write(binary_chunk)
                 else:
                     # This part is missing.
-                    # We must write placeholder null bytes to keep the file
-                    # offsets correct.
-                    
-                    # Check if this is the last chunk
-                    if i == total_parts:
-                        # If it's the last chunk, we don't know the exact
-                        # size, so we can't add padding. Just stop.
-                        pass
-                    else:
-                        # If it's not the last chunk, write null bytes
-                        # for the full chunk size.
+                    if i != total_parts:
+                        # Write null bytes for the full chunk size
                         f_out.write(b'\0' * CHUNK_SIZE_BYTES)
-                        
+                            
         print(f"Successfully saved draft file.")
         print("\nTo resume, run the SENDER with the --remediate flag:")
         print(f"python show_qr_series.py {output_filename} --remediate {json_filename}")
@@ -89,130 +96,156 @@ def save_draft_and_exit(chunks, total_parts, output_filename):
     except Exception as e:
         print(f"Error saving draft file: {e}")
 
+# --- Worker Processes ---
+
+def grabber_process(frame_queue):
+    """
+    Grabs screenshots at the target FPS and puts them in a queue.
+    This runs in its own process.
+    """
+    while True:
+        try:
+            # img = ImageGrab.grab(bbox=GRAB_BBOX) # Changed to full screen grab
+            img = ImageGrab.grab()
+            
+            try:
+                # Put in the queue, but don't wait forever
+                frame_queue.put(img, timeout=0.5) 
+            except queue.Full:
+                # This is the problem: decoders are not keeping up!
+                print("[WARNING] Grabber: Frame queue is full. Decoders are too slow. Dropping frame.")
+                pass # Drop the frame and keep grabbing
+            
+            time.sleep(1.0 / GRAB_FPS)
+        except Exception as e:
+            # Handle cases where screen grab fails (e.g., screen locked)
+            print(f"Grabber error: {e}")
+            time.sleep(1)
+
+def decoder_process(frame_queue, result_queue):
+    """
+    Pulls images from the frame_queue, decodes them,
+    and puts results in the result_queue.
+    This runs in a pool of parallel processes.
+    """
+    # This redirects stderr to os.devnull *within this worker process*
+    # to suppress C-level warnings from zbar.
+    import sys
+    sys.stderr = open(os.devnull, 'w')
+    
+    while True:
+        try:
+            img = frame_queue.get()
+            decoded_objects = decode(img)
+            
+            if decoded_objects:
+                # Put the raw byte data into the result queue
+                result_queue.put(decoded_objects[0].data)
+        except Exception as e:
+            # A single decode error shouldn't crash a worker
+            # print(f"Decoder error: {e}")
+            pass
+
+# --- Main Controller ---
+
 def main_scanner():
     """
-    Scans the screen for a series of QR codes, one by one,
-    and reassembles the file when all parts are found.
-    
-    If cancelled with Ctrl+C, it saves the received parts to a
-    DRAFT file and creates a 'missing_parts.json' file.
+    Main process. Manages the worker processes and
+    assembles the final file from the results queue.
     """
     
-    print("--- Live QR Code Scanner Started ---")
-    print("Please show the QR codes to your screen, one by one.")
+    print("--- High-Performance Scanner Started ---")
+    print(f"Using {NUM_DECODERS} parallel decoder processes.")
     print("Press Ctrl+C to stop scanning and save a draft.")
     print("Waiting for the first part...")
 
-    # Dictionary to store the data chunks, e.g., {1: "base64data", 2: "..."}
-    chunks = {}
+    # Queues for process communication
+    # maxsize helps prevent runaway memory use
+    frame_queue = mp.Queue(maxsize=1000) # Increased buffer
+    result_queue = mp.Queue(maxsize=1000) # Increased buffer
     
-    total_parts = None
-    output_filename = None
+    processes = []
     
-    # Keep track of the last message to avoid spamming the console
-    last_message = ""
-    # Initialize the timeout timer
-    last_part_found_time = time.time()
-
     try:
+        # 1. Start the Grabber Process
+        grabber = mp.Process(target=grabber_process, args=(frame_queue,))
+        grabber.daemon = True
+        grabber.start()
+        processes.append(grabber)
+        
+        # 2. Start the Decoder Process Pool
+        for _ in range(NUM_DECODERS):
+            decoder = mp.Process(target=decoder_process, args=(frame_queue, result_queue))
+            decoder.daemon = True
+            decoder.start()
+            processes.append(decoder)
+
+        # 3. This is the main loop for processing results
+        chunks = {}
+        total_parts = None
+        output_filename = None
+        last_part_found_time = time.time()
+        
         while True:
-            # --- NEW TIMEOUT LOGIC ---
-            # Only start checking for a timeout *after* the first part is found
+            # Check for timeout first
             if total_parts is not None:
                 time_since_last_part = time.time() - last_part_found_time
-                
-                # Check if we are still missing parts AND the timeout has been exceeded
                 if len(chunks) < total_parts and time_since_last_part > SCAN_TIMEOUT_SECONDS:
                     print(f"\nScan timed out (no new parts found in {SCAN_TIMEOUT_SECONDS} seconds).")
                     print("Assuming broadcast is complete.")
-                    save_draft_and_exit(chunks, total_parts, output_filename)
-                    break # Exit the main while loop
-            # --- END TIMEOUT LOGIC ---
-
-            # 1. Capture the entire screen
-            # This is more robust.
-            screen_image = ImageGrab.grab() 
-
-
-            # 2. Try to find and decode QR codes in the screenshot
+                    raise KeyboardInterrupt # Trigger the cleanup/save
+            
             try:
-                decoded_objects = decode(screen_image)
-            except Exception as e:
-                # This can happen on some frames, not a fatal error
-                # print(f"Error decoding image: {e}") 
-                time.sleep(0.5) # Wait a bit if decoding fails
-                continue
-
-            if not decoded_objects:
-                # No QR codes found on screen, try again
-                time.sleep(0.5) # 500ms delay
-                continue
-
-            # 3. Process the first QR code found
-            qr_data_string = decoded_objects[0].data.decode('utf-8')
-
-            try:
-                # 4. Attempt to parse the QR data as our expected JSON
-                payload = json.loads(qr_data_string)
+                # Check for a result from the decoder pool
+                # Use a short timeout to keep the loop responsive
+                qr_data_string = result_queue.get(timeout=0.05).decode('utf-8')
                 
-                part_num = payload['p']
-                base64_data = payload['d']
-                
-                # 5. Check if this is a new part
-                if part_num not in chunks:
+                # Try to parse the result
+                try:
+                    payload = json.loads(qr_data_string)
+                    part_num = payload['p']
+                    base64_data = payload['d']
                     
-                    # If this is the very first part, set up the job
-                    if total_parts is None:
-                        total_parts = payload['t']
-                        output_filename = payload['f']
-                        print("\n--- Found First Part! ---")
-                        print(f"Target file: {output_filename}")
-                        print(f"Total parts to find: {total_parts}")
-                        
-                        # Check if a DRAFT file already exists
-                        draft_file = f"DRAFT_{output_filename}"
-                        if os.path.exists(draft_file):
-                            print(f"Resuming from existing '{draft_file}'.")
-                            print("Loading existing parts from draft...")
-                            # This logic re-reads the draft file to populate chunks.
-                            try:
-                                with open(draft_file, 'rb') as f_in:
-                                    for i in range(1, total_parts + 1):
-                                        chunk = f_in.read(CHUNK_SIZE_BYTES)
-                                        if not chunk:
-                                            break # End of file
-                                        
-                                        # Check if chunk is all null bytes
-                                        # (b'\0' * len(chunk)) handles the final, shorter chunk
-                                        if chunk != (b'\0' * CHUNK_SIZE_BYTES) and chunk != (b'\0' * len(chunk)):
-                                            # This is real data
-                                            if i not in chunks:
-                                                chunks[i] = base64.b64encode(chunk).decode('utf-8')
-                                
-                                print(f"Loaded {len(chunks)} existing parts.")
+                    if part_num not in chunks:
+                        if total_parts is None:
+                            total_parts = payload['t']
+                            output_filename = payload['f']
+                            print("\n--- Found First Part! ---")
+                            print(f"Target file: {output_filename}")
+                            print(f"Total parts to find: {total_parts}")
                             
-                            except Exception as e:
-                                print(f"Error reading draft file: {e}")
+                            # Check for/load draft file
+                            draft_file = f"DRAFT_{output_filename}"
+                            if os.path.exists(draft_file):
+                                print(f"Resuming from existing '{draft_file}'.")
+                                print("Loading existing parts from draft...")
+                                try:
+                                    with open(draft_file, 'rb') as f_in:
+                                        for i in range(1, total_parts + 1):
+                                            chunk = f_in.read(CHUNK_SIZE_BYTES)
+                                            if not chunk: break
+                                            if chunk != (b'\0' * CHUNK_SIZE_BYTES) and chunk != (b'\0' * len(chunk)):
+                                                if i not in chunks:
+                                                    chunks[i] = base64.b64encode(chunk).decode('utf-8')
+                                    print(f"Loaded {len(chunks)} existing parts.")
+                                except Exception as e:
+                                    print(f"Error reading draft file: {e}")
 
-                    # --- RESET THE TIMEOUT ---
-                    # A new part was found, so reset the timer
-                    last_part_found_time = time.time()
+                        # A new part was found! Reset the timeout timer.
+                        last_part_found_time = time.time()
+                        chunks[part_num] = base64_data
+                        print(f"Captured part {part_num}/{total_parts}. Progress: [{len(chunks)} of {total_parts}]")
 
-                    # Store the new chunk
-                    chunks[part_num] = base64_data
-                    
-                    progress_message = f"Captured part {part_num}/{total_parts}. Progress: [{len(chunks)} of {total_parts}]"
-                    print(progress_message)
-                    last_message = progress_message
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    print("Found an unrelated QR code. Ignoring...")
 
-            except (json.JSONDecodeError, KeyError, TypeError):
-                # The QR code found was not in our expected JSON format.
-                if last_message != "Found an unrelated QR code. Ignoring...":
-                    last_message = "Found an unrelated QR code. Ignoring..."
-                    print(last_message)
-                pass # Ignore it and continue scanning
+            except queue.Empty:
+                # This is normal, means no QR was decoded in the last 50ms
+                # Just loop again
+                time.sleep(0.01) # Small sleep to prevent busy-looping
+                continue
 
-            # 6. Check for completion
+            # Check for completion
             if total_parts is not None and len(chunks) == total_parts:
                 print("\n--- All Parts Found! ---")
                 print("Reassembling file...")
@@ -221,39 +254,37 @@ def main_scanner():
                 
                 try:
                     with open(restored_filename, 'wb') as f_out:
-                        # Reassemble in the correct order
                         for i in range(1, total_parts + 1):
-                            base64_data = chunks[i]
-                            binary_chunk = base64.b64decode(base64_data)
-                            f_out.write(binary_chunk)
+                            f_out.write(base64.b64decode(chunks[i]))
                             
                     print(f"\nSUCCESS! File reassembled as '{restored_filename}'.")
-                    print("Terminating script.")
                     
-                    # Clean up draft files if they exist
+                    # Clean up draft files
                     draft_file = f"DRAFT_{output_filename}"
                     json_file = "missing_parts.json"
-                    
-                    if os.path.exists(draft_file):
-                        os.remove(draft_file)
-                        print(f"Removed draft file: {draft_file}")
-                    if os.path.exists(json_file):
-                        os.remove(json_file)
-                        print(f"Removed remediation file: {json_file}")
+                    if os.path.exists(draft_file): os.remove(draft_file)
+                    if os.path.exists(json_file): os.remove(json_file)
                         
-                    break # Exit the while loop and end the program
+                    break # Exit the main while loop
 
                 except Exception as e:
                     print(f"FATAL ERROR: Could not write file. {e}")
                     break
-            
-            # Wait before the next screen capture
-            time.sleep(0.5) # 500ms delay
 
     except KeyboardInterrupt:
-        print("\n--- Scan Cancelled By User ---")
+        # User pressed Ctrl+C
         save_draft_and_exit(chunks, total_parts, output_filename)
 
+    finally:
+        # Clean up all worker processes
+        print("\nStopping worker processes...")
+        for p in processes:
+            p.terminate()
+            p.join()
+        print("Script terminated.")
+
 if __name__ == "__main__":
+    # This is crucial for multiprocessing on Windows
+    mp.freeze_support()
     main_scanner()
 
