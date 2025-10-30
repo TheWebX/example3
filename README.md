@@ -10,11 +10,16 @@ python receiver.py
 
 
 
+
 			"ME_CONFIG_MONGODB_PORT=27017",
 			"ME_CONFIG_MONGODB_AUTH_DATABASE=test12",
 			"ME_CONFIG_MONGODB_AUTH_USERNAME=test12",
 			"ME_CONFIG_MONGODB_AUTH_PASSWORD=test12",
+			"ME_CONFIG_BASICAUTH_USERNAME=test12",
+			"ME_CONFIG_BASICAUTH_PASSWORD=test12",
 			"ME_CONFIG_MONGODB_SERVER=192.168.50.121",
+			"ME_CONFIG_MONGODB_SSL=true",
+			"ME_CONFIG_MONGODB_SSL_CA_FILE=/certs/aws-ca.pem",
 			"ME_CONFIG_MONGODB_URL=mongodb://192.168.50.121:27017",
 			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 			"NODE_VERSION=18.20.3",
@@ -23,3 +28,9 @@ python receiver.py
 			"ME_CONFIG_SITE_SESSIONSECRET=secret",
 			"ME_CONFIG_BASICAUTH=true",
 			"VCAP_APP_HOST=0.0.0.0"
+			
+			
+			
+			-v C:\my-docker-data\aws-ca.pem:/certs/aws-ca.pem \
+			
+			
